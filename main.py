@@ -5,10 +5,13 @@ import helper
 import warnings
 from distutils.version import LooseVersion
 import project_tests as tests
+from subprocess import call
 
+import time
 
 # Check TensorFlow Version
-assert LooseVersion(tf.__version__) >= LooseVersion('1.0'), 'Please use TensorFlow version 1.0 or newer.  You are using {}'.format(tf.__version__)
+assert LooseVersion(tf.__version__) >= LooseVersion(
+    '1.0'), 'Please use TensorFlow version 1.0 or newer.  You are using {}'.format(tf.__version__)
 print('TensorFlow Version: {}'.format(tf.__version__))
 
 # Check for a GPU
@@ -17,6 +20,13 @@ if not tf.test.gpu_device_name():
 else:
     print('Default GPU Device: {}'.format(tf.test.gpu_device_name()))
 
+# tune the hyperpara
+LEARNING_RATE = 1e-4
+KEEP_PROB = 0.5
+L2_LOSS_SCALE = 1e-4
+BETA_LOSS = 0.1
+
+STDDEV = 0.001
 
 def load_vgg(sess, vgg_path):
     """
@@ -33,10 +43,18 @@ def load_vgg(sess, vgg_path):
     vgg_layer3_out_tensor_name = 'layer3_out:0'
     vgg_layer4_out_tensor_name = 'layer4_out:0'
     vgg_layer7_out_tensor_name = 'layer7_out:0'
-    
-    return None, None, None, None, None
-tests.test_load_vgg(load_vgg, tf)
 
+    tf.saved_model.loader.load(sess, [vgg_tag], vgg_path)
+    graph = tf.get_default_graph()
+    input = graph.get_tensor_by_name(vgg_input_tensor_name)
+    keep_prob = graph.get_tensor_by_name(vgg_keep_prob_tensor_name)
+    layer3 = graph.get_tensor_by_name(vgg_layer3_out_tensor_name)
+    layer4 = graph.get_tensor_by_name(vgg_layer4_out_tensor_name)
+    layer7 = graph.get_tensor_by_name(vgg_layer7_out_tensor_name)
+
+    return input, keep_prob, layer3, layer4, layer7
+
+#tests.test_load_vgg(load_vgg, tf)
 
 def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
     """
@@ -48,7 +66,26 @@ def layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes):
     :return: The Tensor for the last layer of output
     """
     # TODO: Implement function
-    return None
+    initializer = tf.random_normal_initializer(stddev=STDDEV)
+    regularizer = tf.contrib.layers.l2_regularizer(L2_LOSS_SCALE)
+
+    layer7_conv_1 = tf.layers.conv2d(vgg_layer7_out, num_classes, 1, 1, padding='same', kernel_initializer=initializer,
+                                     kernel_regularizer=regularizer)
+    output = tf.layers.conv2d_transpose(layer7_conv_1, num_classes, 4, 2, padding='same',
+                                        kernel_initializer=initializer, kernel_regularizer=regularizer)
+    layer4_conv_1 = tf.layers.conv2d(vgg_layer4_out, num_classes, 1, 1, padding='same', kernel_initializer=initializer,
+                                     kernel_regularizer=regularizer)
+    output = tf.add(output, layer4_conv_1)
+    output = tf.layers.conv2d_transpose(output, num_classes, 4, 2, padding='same', kernel_initializer=initializer,
+                                        kernel_regularizer=regularizer)
+    layer3_conv_1 = tf.layers.conv2d(vgg_layer3_out, num_classes, 1, 1, padding='same', kernel_initializer=initializer,
+                                     kernel_regularizer=regularizer)
+    output = tf.add(output, layer3_conv_1)
+    output = tf.layers.conv2d_transpose(output, num_classes, 16, 8, padding='same', kernel_initializer=initializer,
+                                        kernel_regularizer=regularizer)
+
+    return output
+
 tests.test_layers(layers)
 
 
@@ -62,8 +99,23 @@ def optimize(nn_last_layer, correct_label, learning_rate, num_classes):
     :return: Tuple of (logits, train_op, cross_entropy_loss)
     """
     # TODO: Implement function
-    return None, None, None
-tests.test_optimize(optimize)
+    logits = tf.reshape(nn_last_layer, (-1, num_classes))
+    labels = tf.reshape(correct_label, (-1, num_classes))
+
+    # add L2 regularization loss
+    vars = tf.trainable_variables()
+#     l2_loss = tf.add_n([tf.nn.l2_loss(v) for v in vars if 'bias' not in v.name]) * L2_LOSS_BETA
+    l2_loss = tf.get_collection(tf.GraphKeys.REGULARIZATION_LOSSES)
+
+    loss = tf.reduce_mean(tf.nn.softmax_cross_entropy_with_logits(logits=logits, labels=labels))
+    loss = loss + sum(l2_loss) * BETA_LOSS ## add L2 regularizer loss to total loss
+
+    train = tf.train.AdamOptimizer(learning_rate).minimize(loss)
+
+    return logits, train, loss
+
+
+#tests.test_optimize(optimize)
 
 
 def train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_loss, input_image,
@@ -82,16 +134,28 @@ def train_nn(sess, epochs, batch_size, get_batches_fn, train_op, cross_entropy_l
     :param learning_rate: TF Placeholder for learning rate
     """
     # TODO: Implement function
-    pass
-tests.test_train_nn(train_nn)
+    sess.run(tf.global_variables_initializer())
+    print("Training Start!")
+
+    saver = tf.train.Saver(max_to_keep=2)
+    for i in range(epochs):
+        start = time.time()
+        print("EPOCH {} ...".format(i + 1))
+        for image, label in get_batches_fn(batch_size):
+            _, loss = sess.run([train_op, cross_entropy_loss],
+                               feed_dict={input_image: image, correct_label: label, keep_prob: KEEP_PROB,
+                                          learning_rate: LEARNING_RATE})
+        print("Loss: = {:.3f}".format(loss/batch_size), " Time: ", str(time.time() - start))
+        
+#tests.test_train_nn(train_nn)
 
 
 def run():
     num_classes = 2
     image_shape = (160, 576)  # KITTI dataset uses 160x576 images
-    data_dir = './data'
+    data_dir = '/data'
     runs_dir = './runs'
-    tests.test_for_kitti_dataset(data_dir)
+#    tests.test_for_kitti_dataset(data_dir)
 
     # Download pretrained vgg model
     helper.maybe_download_pretrained_vgg(data_dir)
@@ -99,8 +163,10 @@ def run():
     # OPTIONAL: Train and Inference on the cityscapes dataset instead of the Kitti dataset.
     # You'll need a GPU with at least 10 teraFLOPS to train on.
     #  https://www.cityscapes-dataset.com/
-
-    with tf.Session() as sess:
+    ## automatically allocate the GPU memory
+    config = tf.ConfigProto()
+    config.gpu_options.allow_growth = True
+    with tf.Session(config=config) as sess:
         # Path to vgg model
         vgg_path = os.path.join(data_dir, 'vgg')
         # Create function to get batches
@@ -111,11 +177,32 @@ def run():
 
         # TODO: Build NN using load_vgg, layers, and optimize function
 
+        epochs = 50
+        batch_size = 16  ## Depends on GPU and CPU memory, also over-sized batch size could cause optimizer falling into local minimum
+        
+        correct_label = tf.placeholder(tf.int32, [None, None, None, num_classes], name='correct_label')
+        learning_rate = tf.placeholder(tf.float32, name='learning_rate')
+
+        input_image, keep_prob, vgg_layer3_out, vgg_layer4_out, vgg_layer7_out = load_vgg(sess, vgg_path)
+        nn_last_layer = layers(vgg_layer3_out, vgg_layer4_out, vgg_layer7_out, num_classes)
+        logits, train, loss = optimize(nn_last_layer, correct_label, learning_rate, num_classes)
+        
+        # Load trained model
+        #saver = tf.train.import_meta_graph('./weights/09020606/Epoches_50_09020606.meta')
+        #saver.restore(sess, './weights/09020606/Epoches_50_09020606')
+        
         # TODO: Train NN using the train_nn function
+        train_nn(sess, epochs, batch_size, get_batches_fn, train, loss, input_image, correct_label, 
+                 keep_prob, learning_rate)
 
         # TODO: Save inference data using helper.save_inference_samples
-        #  helper.save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, keep_prob, input_image)
-
+        
+        helper.save_inference_samples(runs_dir, data_dir, sess, image_shape, logits, keep_prob, input_image)
+        
+#         file_folder = 'weights/' + time.strftime("%m%d%H%M")
+#         call(["mkdir", file_folder])
+#         saver = tf.train.Saver(max_to_keep=2)
+#         saver.save(sess, os.path.join(file_folder, 'Epoches_' + str(epochs) + '_' + time.strftime("%m%d%H%M" + '.ckpt')))
         # OPTIONAL: Apply the trained model to a video
 
 
